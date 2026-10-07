@@ -1,0 +1,18 @@
+{
+  "name": "raahi-admin-portal",
+  "version": "1.0.0",
+  "description": "Raahi Admin Verification Portal - Independent Backend Verification System",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start -p 3001"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
+    "lucide-react": "^0.511.0",
+    "next": "^15.3.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  }
+}
