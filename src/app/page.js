@@ -27,43 +27,34 @@ export default function AdminPortalHome() {
   const fetchVerifications = useCallback(async () => {
     try {
       setLoading(true);
-      const emailMap = new Map();
 
-      // 1. Try dedicated table first if available
+      // 1. Fetch from admin portal API route (bridges Carpool app & shared file storage)
       try {
-        const { data: dedicated } = await supabase
-          .from('verifications')
-          .select('*')
-          .order('submittedAt', { ascending: false });
-        if (dedicated && dedicated.length > 0) {
-          setVerifications(dedicated);
-          setLoading(false);
-          return;
-        }
-      } catch (err) {}
-
-      // 2. Fetch directly from Supabase rides storage
-      const { data: rows, error } = await supabase
-        .from('rides')
-        .select('*')
-        .ilike('status', 'VERIFICATION_%')
-        .order('id', { ascending: false });
-
-      if (rows && rows.length > 0) {
-        rows.forEach((r) => {
-          if (r.driver && r.driver.type === 'DOC_VERIFICATION' && r.driver.email) {
-            const userEmail = r.driver.email.toLowerCase();
-            if (!emailMap.has(userEmail)) {
-              emailMap.set(userEmail, r.driver);
-            }
+        const res = await fetch('/api/verifications', { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.verifications && Array.isArray(data.verifications)) {
+            setVerifications(data.verifications);
+            setLoading(false);
+            return;
           }
-        });
-      }
+        }
+      } catch (e) {}
 
-      const list = Array.from(emailMap.values());
-      setVerifications(list.sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt)));
+      // 2. Direct fallback to Carpool app API (port 3000)
+      try {
+        const fallbackRes = await fetch('http://localhost:3000/api/verification', { cache: 'no-store' });
+        if (fallbackRes.ok) {
+          const fbData = await fallbackRes.json();
+          if (fbData.verifications && Array.isArray(fbData.verifications)) {
+            setVerifications(fbData.verifications);
+            setLoading(false);
+            return;
+          }
+        }
+      } catch (e) {}
     } catch (err) {
-      console.error('Failed to fetch from Supabase:', err);
+      console.error('Failed to fetch verifications:', err);
     } finally {
       setLoading(false);
     }
@@ -71,6 +62,9 @@ export default function AdminPortalHome() {
 
   useEffect(() => {
     fetchVerifications();
+    // Auto-refresh periodically every 5 seconds to catch new user uploads live
+    const interval = setInterval(fetchVerifications, 5000);
+    return () => clearInterval(interval);
   }, [fetchVerifications]);
 
   const handleReview = async (item, action) => {
@@ -80,44 +74,41 @@ export default function AdminPortalHome() {
 
     setActionInProgress((prev) => ({ ...prev, [item.id]: true }));
 
+    // Optimistically update UI
+    setVerifications((prev) =>
+      prev.map((v) =>
+        v.id === item.id || v.email === item.email
+          ? { ...v, status, adminNotes: note, reviewedAt }
+          : v
+      )
+    );
+
     try {
-      const normEmail = item.email.toLowerCase();
-      const updateId = `doc_${normEmail.replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
-
-      const updatedDriver = {
-        ...item,
-        status,
-        adminNotes: note,
-        reviewedAt,
-      };
-
-      // 1. Insert update into Supabase rides audit store
-      await supabase.from('rides').insert([
-        {
-          id: updateId,
-          driver: {
-            type: 'DOC_VERIFICATION',
-            ...updatedDriver,
-          },
-          status: action === 'APPROVE' ? 'VERIFICATION_APPROVED' : 'VERIFICATION_REJECTED',
-        },
-      ]);
-
-      // 2. Also update dedicated verifications table if present
+      // 1. Post to admin portal review API
+      let success = false;
       try {
-        await supabase
-          .from('verifications')
-          .update({
-            status,
-            adminNotes: note,
-            reviewedAt,
-          })
-          .eq('email', normEmail);
+        const res = await fetch(`/api/verifications/${encodeURIComponent(item.id)}/review`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, adminNotes: note }),
+        });
+        if (res.ok) success = true;
       } catch (e) {}
+
+      // 2. Fallback directly to Carpool App review API
+      if (!success) {
+        try {
+          await fetch(`http://localhost:3000/api/verification/${encodeURIComponent(item.id)}/review`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action, adminNotes: note }),
+          });
+        } catch (e) {}
+      }
 
       await fetchVerifications();
     } catch (err) {
-      console.error('Error reviewing in Supabase:', err);
+      console.error('Error reviewing in admin portal:', err);
       alert('Error updating status: ' + err.message);
     } finally {
       setActionInProgress((prev) => ({ ...prev, [item.id]: false }));
@@ -143,7 +134,7 @@ export default function AdminPortalHome() {
           <span className={styles.logoBadge}>PROD PORTAL</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-          <Lock size={14} color="#10b981" /> Supabase Connected
+          <Lock size={14} color="#10b981" /> Live Sync Active
         </div>
       </div>
 
