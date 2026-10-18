@@ -50,46 +50,62 @@ export default function AdminPortalHome() {
   const fetchVerifications = useCallback(async () => {
     try {
       setLoading(true);
-      const activeBackend = getTargetBackend();
+      const emailMap = new Map();
 
-      // 1. Fetch from admin portal API route (bridges Carpool app & shared file storage)
+      // 1. DIRECT QUERY TO SUPABASE CLOUD DATABASE
       try {
+        const { data: rideRows, error: sbError } = await supabase
+          .from('rides')
+          .select('*')
+          .ilike('status', 'VERIFICATION_%');
+
+        if (rideRows && rideRows.length > 0) {
+          const sortedRows = rideRows.sort((a, b) => {
+            const timeA = new Date(a.driver?.submittedAt || a.driver?.reviewedAt || 0).getTime();
+            const timeB = new Date(b.driver?.submittedAt || b.driver?.reviewedAt || 0).getTime();
+            return timeB - timeA;
+          });
+
+          sortedRows.forEach((r) => {
+            if (r.driver && (r.driver.type === 'DOC_VERIFICATION' || r.driver.email)) {
+              const userEmail = (r.driver.email || '').toLowerCase().trim();
+              if (userEmail && !emailMap.has(userEmail)) {
+                const status = r.status === 'VERIFICATION_APPROVED' ? 'APPROVED'
+                  : r.status === 'VERIFICATION_REJECTED' ? 'REJECTED'
+                  : (r.driver.status || 'PENDING');
+                emailMap.set(userEmail, {
+                  ...r.driver,
+                  id: r.driver.id || r.id,
+                  status,
+                  rowId: r.id,
+                });
+              }
+            }
+          });
+        }
+      } catch (err) {
+        console.error('Supabase direct fetch error:', err);
+      }
+
+      // 2. Also merge from API route if available
+      try {
+        const activeBackend = getTargetBackend();
         const headers = activeBackend ? { 'x-carpool-backend-url': activeBackend } : {};
         const res = await fetch('/api/verifications', { headers, cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
-          if (data.verifications && Array.isArray(data.verifications) && data.verifications.length > 0) {
-            setVerifications(data.verifications);
-            setLoading(false);
-            return;
+          if (data.verifications && Array.isArray(data.verifications)) {
+            data.verifications.forEach((v) => {
+              if (v && v.email && !emailMap.has(v.email.toLowerCase())) {
+                emailMap.set(v.email.toLowerCase(), v);
+              }
+            });
           }
         }
       } catch (e) {}
 
-      // 2. Direct fallback to Carpool app API
-      if (activeBackend) {
-        try {
-          const targetUrl = `${activeBackend.replace(/\/$/, '')}/api/verification`;
-          const fallbackRes = await fetch(targetUrl, { cache: 'no-store' });
-          if (fallbackRes.ok) {
-            const fbData = await fallbackRes.json();
-            if (fbData.verifications && Array.isArray(fbData.verifications)) {
-              setVerifications(fbData.verifications);
-              setLoading(false);
-              return;
-            }
-          }
-        } catch (e) {}
-      }
-
-      // If nothing returned from activeBackend, load whatever /api/verifications returned
-      const res = await fetch('/api/verifications', { cache: 'no-store' });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.verifications && Array.isArray(data.verifications)) {
-          setVerifications(data.verifications);
-        }
-      }
+      const list = Array.from(emailMap.values());
+      setVerifications(list.sort((a, b) => new Date(b.submittedAt || 0) - new Date(a.submittedAt || 0)));
     } catch (err) {
       console.error('Failed to fetch verifications:', err);
     } finally {
@@ -122,32 +138,43 @@ export default function AdminPortalHome() {
     );
 
     try {
-      // 1. Post to admin portal review API
-      let success = false;
+      const normEmail = item.email.toLowerCase();
+      const updateId = `doc_${normEmail.replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
+      const updatedDriver = {
+        ...item,
+        status,
+        adminNotes: note,
+        reviewedAt,
+      };
+
+      // 1. Direct write to Supabase cloud database
+      try {
+        await supabase.from('rides').insert([
+          {
+            id: updateId,
+            driver: {
+              type: 'DOC_VERIFICATION',
+              ...updatedDriver,
+            },
+            status: action === 'APPROVE' ? 'VERIFICATION_APPROVED' : 'VERIFICATION_REJECTED',
+          },
+        ]);
+      } catch (sbErr) {
+        console.error('Supabase direct review insert error:', sbErr);
+      }
+
+      // 2. Also notify admin portal review API & backend if connected
       try {
         const headers = {
           'Content-Type': 'application/json',
           ...(activeBackend ? { 'x-carpool-backend-url': activeBackend } : {}),
         };
-        const res = await fetch(`/api/verifications/${encodeURIComponent(item.id)}/review`, {
+        await fetch(`/api/verifications/${encodeURIComponent(item.id)}/review`, {
           method: 'POST',
           headers,
           body: JSON.stringify({ action, adminNotes: note }),
         });
-        if (res.ok) success = true;
       } catch (e) {}
-
-      // 2. Fallback directly to Carpool App review API
-      if (!success && activeBackend) {
-        try {
-          const directUrl = `${activeBackend.replace(/\/$/, '')}/api/verification/${encodeURIComponent(item.id)}/review`;
-          await fetch(directUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action, adminNotes: note }),
-          });
-        } catch (e) {}
-      }
 
       await fetchVerifications();
     } catch (err) {
