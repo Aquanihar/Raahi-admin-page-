@@ -47,6 +47,17 @@ export default function AdminPortalHome() {
     return backendUrl || process.env.NEXT_PUBLIC_CARPOOL_API_URL || '';
   }, [backendUrl]);
 
+  const getRowTimestamp = (r) => {
+    if (!r) return 0;
+    const tRev = r.driver?.reviewedAt ? new Date(r.driver.reviewedAt).getTime() : 0;
+    const tSub = r.driver?.submittedAt ? new Date(r.driver.submittedAt).getTime() : 0;
+    const idMatch = (r.id || '').match(/_(\d{13})$/);
+    const tId = idMatch ? parseInt(idMatch[1], 10) : 0;
+    const tCreated = r.created_at ? new Date(r.created_at).getTime() : 0;
+    const tUpdated = r.updated_at ? new Date(r.updated_at).getTime() : 0;
+    return Math.max(tRev, tSub, tId, tCreated, tUpdated);
+  };
+
   const fetchVerifications = useCallback(async () => {
     try {
       setLoading(true);
@@ -60,27 +71,44 @@ export default function AdminPortalHome() {
           .ilike('status', 'VERIFICATION_%');
 
         if (rideRows && rideRows.length > 0) {
-          const sortedRows = rideRows.sort((a, b) => {
-            const timeA = new Date(a.driver?.submittedAt || a.driver?.reviewedAt || 0).getTime();
-            const timeB = new Date(b.driver?.submittedAt || b.driver?.reviewedAt || 0).getTime();
-            return timeB - timeA;
-          });
-
-          sortedRows.forEach((r) => {
+          // Group rows by user email
+          const groups = new Map();
+          rideRows.forEach((r) => {
             if (r.driver && (r.driver.type === 'DOC_VERIFICATION' || r.driver.email)) {
               const userEmail = (r.driver.email || '').toLowerCase().trim();
-              if (userEmail && !emailMap.has(userEmail)) {
-                const status = r.status === 'VERIFICATION_APPROVED' ? 'APPROVED'
-                  : r.status === 'VERIFICATION_REJECTED' ? 'REJECTED'
-                  : (r.driver.status || 'PENDING');
-                emailMap.set(userEmail, {
-                  ...r.driver,
-                  id: r.driver.id || r.id,
-                  status,
-                  rowId: r.id,
-                });
+              if (userEmail) {
+                if (!groups.has(userEmail)) groups.set(userEmail, []);
+                groups.get(userEmail).push(r);
               }
             }
+          });
+
+          // For each user, sort descending by true timestamp and extract latest status & photos
+          groups.forEach((userRows, userEmail) => {
+            userRows.sort((a, b) => getRowTimestamp(b) - getRowTimestamp(a));
+            const latest = userRows[0];
+            const photoRow = userRows.find(
+              (r) => r.driver?.idProofBase64 || r.driver?.drivingLicenseBase64
+            ) || latest;
+
+            const status = latest.status === 'VERIFICATION_APPROVED' ? 'APPROVED'
+              : latest.status === 'VERIFICATION_REJECTED' ? 'REJECTED'
+              : (latest.driver?.status || 'PENDING');
+
+            emailMap.set(userEmail, {
+              ...photoRow.driver,
+              ...latest.driver,
+              id: latest.driver?.id || latest.id,
+              status,
+              rowId: latest.id,
+              idProofBase64: photoRow.driver?.idProofBase64 || latest.driver?.idProofBase64 || '',
+              idProofName: photoRow.driver?.idProofName || latest.driver?.idProofName || 'Identity Document',
+              drivingLicenseBase64: photoRow.driver?.drivingLicenseBase64 || latest.driver?.drivingLicenseBase64 || '',
+              drivingLicenseName: photoRow.driver?.drivingLicenseName || latest.driver?.drivingLicenseName || 'Driving License',
+              submittedAt: photoRow.driver?.submittedAt || latest.driver?.submittedAt || new Date(getRowTimestamp(photoRow)).toISOString(),
+              reviewedAt: latest.driver?.reviewedAt || (status !== 'PENDING' ? new Date(getRowTimestamp(latest)).toISOString() : null),
+              adminNotes: latest.driver?.adminNotes || '',
+            });
           });
         }
       } catch (err) {
@@ -96,8 +124,24 @@ export default function AdminPortalHome() {
           const data = await res.json();
           if (data.verifications && Array.isArray(data.verifications)) {
             data.verifications.forEach((v) => {
-              if (v && v.email && !emailMap.has(v.email.toLowerCase())) {
-                emailMap.set(v.email.toLowerCase(), v);
+              if (v && v.email) {
+                const normEmail = v.email.toLowerCase().trim();
+                const existing = emailMap.get(normEmail);
+                if (!existing) {
+                  emailMap.set(normEmail, v);
+                } else {
+                  // Merge if API has newer or richer data
+                  const vTime = new Date(v.reviewedAt || v.submittedAt || 0).getTime();
+                  const eTime = new Date(existing.reviewedAt || existing.submittedAt || 0).getTime();
+                  if (vTime > eTime) {
+                    emailMap.set(normEmail, {
+                      ...existing,
+                      ...v,
+                      idProofBase64: existing.idProofBase64 || v.idProofBase64 || '',
+                      drivingLicenseBase64: existing.drivingLicenseBase64 || v.drivingLicenseBase64 || '',
+                    });
+                  }
+                }
               }
             });
           }
@@ -105,7 +149,13 @@ export default function AdminPortalHome() {
       } catch (e) {}
 
       const list = Array.from(emailMap.values());
-      setVerifications(list.sort((a, b) => new Date(b.submittedAt || 0) - new Date(a.submittedAt || 0)));
+      setVerifications(
+        list.sort(
+          (a, b) =>
+            new Date(b.reviewedAt || b.submittedAt || 0) -
+            new Date(a.reviewedAt || a.submittedAt || 0)
+        )
+      );
     } catch (err) {
       console.error('Failed to fetch verifications:', err);
     } finally {
@@ -123,28 +173,34 @@ export default function AdminPortalHome() {
   const handleReview = async (item, action) => {
     const status = action === 'APPROVE' ? 'APPROVED' : 'REJECTED';
     const note = adminNotes[item.id] || (action === 'REJECT' ? 'Invalid documents try with Original documents' : 'Verified successfully.');
-    const reviewedAt = new Date().toISOString();
+    const now = new Date();
+    const reviewedAt = now.toISOString();
     const activeBackend = getTargetBackend();
+    const normEmail = (item.email || '').toLowerCase().trim();
+    const updateId = `doc_${normEmail.replace(/[^a-z0-9]/g, '_')}_${now.getTime()}`;
 
     setActionInProgress((prev) => ({ ...prev, [item.id]: true }));
 
     // Optimistically update UI
     setVerifications((prev) =>
       prev.map((v) =>
-        v.id === item.id || v.email === item.email
+        (v.id === item.id || v.email?.toLowerCase().trim() === normEmail)
           ? { ...v, status, adminNotes: note, reviewedAt }
           : v
       )
     );
 
     try {
-      const normEmail = item.email.toLowerCase();
-      const updateId = `doc_${normEmail.replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
       const updatedDriver = {
         ...item,
+        id: updateId,
         status,
         adminNotes: note,
         reviewedAt,
+        idProofBase64: item.idProofBase64 || '',
+        idProofName: item.idProofName || '',
+        drivingLicenseBase64: item.drivingLicenseBase64 || '',
+        drivingLicenseName: item.drivingLicenseName || '',
       };
 
       // 1. Direct write to Supabase cloud database
@@ -176,6 +232,7 @@ export default function AdminPortalHome() {
         });
       } catch (e) {}
 
+      // Refresh to confirm live state from database
       await fetchVerifications();
     } catch (err) {
       console.error('Error reviewing in admin portal:', err);

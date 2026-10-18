@@ -60,84 +60,111 @@ export async function POST(req, { params }) {
 
     let updatedRecord = null;
     const customBackendUrl = req.headers.get('x-carpool-backend-url');
-    const backendBase = customBackendUrl || process.env.CARPOOL_API_URL || process.env.NEXT_PUBLIC_CARPOOL_API_URL || 'http://localhost:3000';
+    const backendBase = customBackendUrl || process.env.CARPOOL_API_URL || process.env.NEXT_PUBLIC_CARPOOL_API_URL;
 
-    // 1. Try calling Carpool App backend review route
-    try {
-      const targetUrl = `${backendBase.replace(/\/$/, '')}/api/verification/${encodeURIComponent(id)}/review`;
-      const res = await withTimeout(
-        fetch(targetUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action, adminNotes }),
-        }),
-        3000
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.verification) {
-          updatedRecord = data.verification;
+    // 1. Try calling Carpool App backend review route if URL is set
+    if (backendBase) {
+      try {
+        const targetUrl = `${backendBase.replace(/\/$/, '')}/api/verification/${encodeURIComponent(id)}/review`;
+        const res = await withTimeout(
+          fetch(targetUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action, adminNotes }),
+          }),
+          3000
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && data.verification) {
+            updatedRecord = data.verification;
+          }
         }
-      }
-    } catch (e) {}
+      } catch (e) {}
+    }
 
-    // 2. If Carpool app was not reached or not updated, update local file
+    // 2. If Carpool app was not reached, check local file
     if (!updatedRecord) {
       updatedRecord = updateLocalFile(id, action, adminNotes);
     } else {
-      // Keep local file in sync
       updateLocalFile(id, action, adminNotes);
     }
 
-    // 3. Try updating Supabase in background with fast timeout
-    if (updatedRecord) {
-      const normEmail = (updatedRecord.email || id).toLowerCase();
-      const status = action === 'APPROVE' ? 'APPROVED' : 'REJECTED';
-      const finalNotes = adminNotes || (action === 'REJECT' ? 'Invalid documents try with Original documents' : 'Verified successfully.');
-      const reviewedAt = new Date().toISOString();
-
-      try {
-        await withTimeout(
-          supabase
-            .from('verifications')
-            .update({ status, adminNotes: finalNotes, reviewedAt })
-            .or(`id.eq.${id},email.eq.${normEmail}`),
-          1500
-        );
-      } catch (e) {}
-
-      try {
-        const updateId = `doc_${normEmail.replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
-        await withTimeout(
-          supabase.from('rides').insert([
-            {
-              id: updateId,
-              driver: {
-                type: 'DOC_VERIFICATION',
-                ...updatedRecord,
-                status,
-                adminNotes: finalNotes,
-                reviewedAt,
-              },
-              status: action === 'APPROVE' ? 'VERIFICATION_APPROVED' : 'VERIFICATION_REJECTED',
-            },
-          ]),
-          1500
-        );
-      } catch (e) {}
-    }
+    // 3. If still no record, query Supabase cloud rides table directly
+    const decodedId = decodeURIComponent(id);
+    const normEmail = decodedId.includes('@') ? decodedId.toLowerCase().trim() : '';
 
     if (!updatedRecord) {
-      return Response.json({ success: false, message: 'Verification record not found.' }, { status: 404 });
+      try {
+        const { data: rows } = await withTimeout(
+          supabase
+            .from('rides')
+            .select('*')
+            .ilike('status', 'VERIFICATION_%'),
+          3000
+        );
+        if (rows && Array.isArray(rows)) {
+          const matching = rows.filter((r) => {
+            const rEmail = (r.driver?.email || '').toLowerCase().trim();
+            return r.id === decodedId || (normEmail && rEmail === normEmail);
+          });
+          if (matching.length > 0) {
+            const photoRow = matching.find(
+              (r) => r.driver?.idProofBase64 || r.driver?.drivingLicenseBase64
+            ) || matching[0];
+            updatedRecord = {
+              ...photoRow.driver,
+              ...matching[0].driver,
+              id: decodedId,
+              email: matching[0].driver?.email || normEmail,
+            };
+          }
+        }
+      } catch (err) {}
+    }
+
+    // 4. Persist review row to Supabase cloud database
+    const userEmail = (updatedRecord?.email || normEmail || decodedId).toLowerCase().trim();
+    const status = action === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+    const finalNotes = adminNotes || (action === 'REJECT' ? 'Invalid documents try with Original documents' : 'Verified successfully.');
+    const now = new Date();
+    const reviewedAt = now.toISOString();
+    const updateId = `doc_${userEmail.replace(/[^a-z0-9]/g, '_')}_${now.getTime()}`;
+
+    const completeRecord = {
+      ...(updatedRecord || {}),
+      id: updateId,
+      email: userEmail,
+      status,
+      adminNotes: finalNotes,
+      reviewedAt,
+    };
+
+    try {
+      await withTimeout(
+        supabase.from('rides').insert([
+          {
+            id: updateId,
+            driver: {
+              type: 'DOC_VERIFICATION',
+              ...completeRecord,
+            },
+            status: action === 'APPROVE' ? 'VERIFICATION_APPROVED' : 'VERIFICATION_REJECTED',
+          },
+        ]),
+        2500
+      );
+    } catch (e) {
+      console.error('Supabase review insert error in API route:', e);
     }
 
     return Response.json({
       success: true,
       message: action === 'APPROVE' ? 'Document verified and approved successfully!' : 'Document rejected.',
-      verification: updatedRecord,
+      verification: completeRecord,
     });
   } catch (error) {
-    console.error('Error reviewing in admin portal:', error);
+    console.error('Error reviewing in admin portal API:', error);
     return Response.json({ success: false, message: error.message }, { status: 500 });
   }
 }
