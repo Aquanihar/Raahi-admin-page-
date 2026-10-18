@@ -59,16 +59,19 @@ export async function POST(req, { params }) {
     const { action, adminNotes } = body;
 
     let updatedRecord = null;
+    const customBackendUrl = req.headers.get('x-carpool-backend-url');
+    const backendBase = customBackendUrl || process.env.CARPOOL_API_URL || process.env.NEXT_PUBLIC_CARPOOL_API_URL || 'http://localhost:3000';
 
     // 1. Try calling Carpool App backend review route
     try {
+      const targetUrl = `${backendBase.replace(/\/$/, '')}/api/verification/${encodeURIComponent(id)}/review`;
       const res = await withTimeout(
-        fetch(`http://localhost:3000/api/verification/${encodeURIComponent(id)}/review`, {
+        fetch(targetUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action, adminNotes }),
         }),
-        2500
+        3000
       );
       if (res.ok) {
         const data = await res.json();

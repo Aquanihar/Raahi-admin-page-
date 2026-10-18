@@ -34,17 +34,21 @@ function getLocalVerificationsFromFile() {
 export async function GET(req) {
   const recordsMap = new Map();
 
-  // 1. First load from shared local file
+  const customBackendUrl = req.headers.get('x-carpool-backend-url');
+  const backendBase = customBackendUrl || process.env.CARPOOL_API_URL || process.env.NEXT_PUBLIC_CARPOOL_API_URL || 'http://localhost:3000';
+
+  // 1. First load from shared local file (if local)
   const fileRecords = getLocalVerificationsFromFile();
   fileRecords.forEach((r) => {
     if (r && r.email) recordsMap.set(r.email.toLowerCase(), r);
   });
 
-  // 2. Fetch from Carpool App API (port 3000)
+  // 2. Fetch from Carpool App API
   try {
+    const targetUrl = backendBase.replace(/\/$/, '') + '/api/verification';
     const res = await withTimeout(
-      fetch('http://localhost:3000/api/verification', { cache: 'no-store' }),
-      2000
+      fetch(targetUrl, { cache: 'no-store' }),
+      2500
     );
     if (res.ok) {
       const data = await res.json();
@@ -55,7 +59,7 @@ export async function GET(req) {
       }
     }
   } catch (err) {
-    // If Carpool app is restarting, local file fallback was already populated
+    // If Carpool app is restarting or offline, fallback to local/Supabase
   }
 
   // 3. Try Supabase dedicated table with fast timeout

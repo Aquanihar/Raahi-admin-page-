@@ -14,6 +14,7 @@ import {
   Phone,
   Calendar,
   Lock,
+  Globe,
 } from 'lucide-react';
 import styles from './admin.module.css';
 
@@ -23,17 +24,41 @@ export default function AdminPortalHome() {
   const [loading, setLoading] = useState(true);
   const [actionInProgress, setActionInProgress] = useState({});
   const [adminNotes, setAdminNotes] = useState({});
+  const [backendUrl, setBackendUrl] = useState('');
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('raahi_carpool_backend_url');
+      if (saved) {
+        setBackendUrl(saved);
+      } else if (process.env.NEXT_PUBLIC_CARPOOL_API_URL) {
+        setBackendUrl(process.env.NEXT_PUBLIC_CARPOOL_API_URL);
+      } else if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+        setBackendUrl('http://localhost:3000');
+      }
+    }
+  }, []);
+
+  const getTargetBackend = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('raahi_carpool_backend_url');
+      if (saved) return saved.trim();
+    }
+    return backendUrl || process.env.NEXT_PUBLIC_CARPOOL_API_URL || '';
+  }, [backendUrl]);
 
   const fetchVerifications = useCallback(async () => {
     try {
       setLoading(true);
+      const activeBackend = getTargetBackend();
 
       // 1. Fetch from admin portal API route (bridges Carpool app & shared file storage)
       try {
-        const res = await fetch('/api/verifications', { cache: 'no-store' });
+        const headers = activeBackend ? { 'x-carpool-backend-url': activeBackend } : {};
+        const res = await fetch('/api/verifications', { headers, cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
-          if (data.verifications && Array.isArray(data.verifications)) {
+          if (data.verifications && Array.isArray(data.verifications) && data.verifications.length > 0) {
             setVerifications(data.verifications);
             setLoading(false);
             return;
@@ -41,24 +66,36 @@ export default function AdminPortalHome() {
         }
       } catch (e) {}
 
-      // 2. Direct fallback to Carpool app API (port 3000)
-      try {
-        const fallbackRes = await fetch('http://localhost:3000/api/verification', { cache: 'no-store' });
-        if (fallbackRes.ok) {
-          const fbData = await fallbackRes.json();
-          if (fbData.verifications && Array.isArray(fbData.verifications)) {
-            setVerifications(fbData.verifications);
-            setLoading(false);
-            return;
+      // 2. Direct fallback to Carpool app API
+      if (activeBackend) {
+        try {
+          const targetUrl = `${activeBackend.replace(/\/$/, '')}/api/verification`;
+          const fallbackRes = await fetch(targetUrl, { cache: 'no-store' });
+          if (fallbackRes.ok) {
+            const fbData = await fallbackRes.json();
+            if (fbData.verifications && Array.isArray(fbData.verifications)) {
+              setVerifications(fbData.verifications);
+              setLoading(false);
+              return;
+            }
           }
+        } catch (e) {}
+      }
+
+      // If nothing returned from activeBackend, load whatever /api/verifications returned
+      const res = await fetch('/api/verifications', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.verifications && Array.isArray(data.verifications)) {
+          setVerifications(data.verifications);
         }
-      } catch (e) {}
+      }
     } catch (err) {
       console.error('Failed to fetch verifications:', err);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [getTargetBackend]);
 
   useEffect(() => {
     fetchVerifications();
@@ -71,6 +108,7 @@ export default function AdminPortalHome() {
     const status = action === 'APPROVE' ? 'APPROVED' : 'REJECTED';
     const note = adminNotes[item.id] || (action === 'REJECT' ? 'Invalid documents try with Original documents' : 'Verified successfully.');
     const reviewedAt = new Date().toISOString();
+    const activeBackend = getTargetBackend();
 
     setActionInProgress((prev) => ({ ...prev, [item.id]: true }));
 
@@ -87,18 +125,23 @@ export default function AdminPortalHome() {
       // 1. Post to admin portal review API
       let success = false;
       try {
+        const headers = {
+          'Content-Type': 'application/json',
+          ...(activeBackend ? { 'x-carpool-backend-url': activeBackend } : {}),
+        };
         const res = await fetch(`/api/verifications/${encodeURIComponent(item.id)}/review`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({ action, adminNotes: note }),
         });
         if (res.ok) success = true;
       } catch (e) {}
 
       // 2. Fallback directly to Carpool App review API
-      if (!success) {
+      if (!success && activeBackend) {
         try {
-          await fetch(`http://localhost:3000/api/verification/${encodeURIComponent(item.id)}/review`, {
+          const directUrl = `${activeBackend.replace(/\/$/, '')}/api/verification/${encodeURIComponent(item.id)}/review`;
+          await fetch(directUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action, adminNotes: note }),
@@ -112,6 +155,20 @@ export default function AdminPortalHome() {
       alert('Error updating status: ' + err.message);
     } finally {
       setActionInProgress((prev) => ({ ...prev, [item.id]: false }));
+    }
+  };
+
+  const handleConfigureBackend = () => {
+    const current = localStorage.getItem('raahi_carpool_backend_url') || backendUrl || '';
+    const entered = window.prompt(
+      'Enter your deployed Carpool App URL (e.g. https://your-carpool-app.vercel.app):',
+      current
+    );
+    if (entered !== null) {
+      const cleaned = entered.trim();
+      localStorage.setItem('raahi_carpool_backend_url', cleaned);
+      setBackendUrl(cleaned);
+      setTimeout(fetchVerifications, 100);
     }
   };
 
@@ -133,8 +190,31 @@ export default function AdminPortalHome() {
           <span className={styles.logoTitle}>Raahi Admin</span>
           <span className={styles.logoBadge}>PROD PORTAL</span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-          <Lock size={14} color="#10b981" /> Live Sync Active
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <button
+            type="button"
+            onClick={handleConfigureBackend}
+            style={{
+              background: 'rgba(16, 185, 129, 0.1)',
+              border: '1px solid rgba(16, 185, 129, 0.35)',
+              color: '#10b981',
+              padding: '5px 12px',
+              borderRadius: '6px',
+              fontSize: '0.8rem',
+              fontWeight: 500,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+            }}
+            title="Click to configure deployed Carpool App URL"
+          >
+            <Globe size={13} />
+            {backendUrl ? `Backend: ${backendUrl.replace(/^https?:\/\//, '')}` : 'Connect Carpool App 🔗'}
+          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+            <Lock size={14} color="#10b981" /> Live Sync
+          </div>
         </div>
       </div>
 
