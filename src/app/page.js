@@ -15,8 +15,107 @@ import {
   Calendar,
   Lock,
   Globe,
+  Eye,
+  Download,
+  X,
+  Maximize2,
 } from 'lucide-react';
 import styles from './admin.module.css';
+
+// Safely format document string into a valid displayable Data URL or Web URL
+function formatDocSrc(raw, fallbackType = 'image/jpeg') {
+  if (!raw || typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+  if (trimmed.startsWith('data:')) return trimmed;
+  if (trimmed.startsWith('JVBERi')) return `data:application/pdf;base64,${trimmed}`;
+  if (trimmed.startsWith('iVBORw')) return `data:image/png;base64,${trimmed}`;
+  if (trimmed.startsWith('/9j/')) return `data:image/jpeg;base64,${trimmed}`;
+  if (trimmed.startsWith('UklGR')) return `data:image/webp;base64,${trimmed}`;
+  return `data:${fallbackType};base64,${trimmed}`;
+}
+
+// Check whether the document is an image or PDF
+function isImageDoc(src, fileName = '') {
+  if (!src) return false;
+  if (src.startsWith('data:image/')) return true;
+  if (src.startsWith('data:application/pdf')) return false;
+  if (src.startsWith('http://') || src.startsWith('https://')) {
+    return !/\.pdf$/i.test(src);
+  }
+  if (/\.(png|jpe?g|webp|gif|bmp|svg)$/i.test(fileName)) return true;
+  if (/\.pdf$/i.test(fileName) && (src.startsWith('data:application/pdf') || src.includes('JVBERi'))) {
+    return false;
+  }
+  return true;
+}
+
+// Download document safely without hitting browser top-level data URL security blocks
+function downloadDocument(src, fileName) {
+  if (!src) return;
+  try {
+    if (src.startsWith('data:')) {
+      const parts = src.split(';base64,');
+      if (parts.length === 2) {
+        const contentType = parts[0].split(':')[1] || 'application/octet-stream';
+        const raw = window.atob(parts[1]);
+        const uInt8Array = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; ++i) {
+          uInt8Array[i] = raw.charCodeAt(i);
+        }
+        const blob = new Blob([uInt8Array], { type: contentType });
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = fileName || (contentType.includes('pdf') ? 'document.pdf' : 'document.jpg');
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        return;
+      }
+    }
+    const a = document.createElement('a');
+    a.href = src;
+    a.download = fileName || 'document';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } catch (err) {
+    console.error('Download error:', err);
+  }
+}
+
+// Safely open in new window avoiding Chrome top-level data: navigation block
+function openInNewTab(src, title = 'Document Preview') {
+  if (!src) return;
+  if (src.startsWith('http')) {
+    window.open(src, '_blank');
+    return;
+  }
+  const win = window.open('', '_blank');
+  if (win) {
+    win.document.write(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>${title}</title>
+          <style>
+            body { margin: 0; background: #0f172a; display: flex; align-items: center; justify-content: center; min-height: 100vh; font-family: sans-serif; }
+            img { max-width: 95vw; max-height: 95vh; object-fit: contain; box-shadow: 0 10px 30px rgba(0,0,0,0.5); border-radius: 8px; }
+            iframe { width: 100vw; height: 100vh; border: none; }
+          </style>
+        </head>
+        <body>
+          ${src.startsWith('data:application/pdf') 
+            ? `<iframe src="${src}"></iframe>` 
+            : `<img src="${src}" alt="${title}" />`}
+        </body>
+      </html>
+    `);
+    win.document.close();
+  }
+}
 
 export default function AdminPortalHome() {
   const [verifications, setVerifications] = useState([]);
@@ -25,6 +124,7 @@ export default function AdminPortalHome() {
   const [actionInProgress, setActionInProgress] = useState({});
   const [adminNotes, setAdminNotes] = useState({});
   const [backendUrl, setBackendUrl] = useState('');
+  const [previewModal, setPreviewModal] = useState(null); // { src, title, fileName, isImage, user }
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -37,6 +137,15 @@ export default function AdminPortalHome() {
         setBackendUrl('http://localhost:3000');
       }
     }
+  }, []);
+
+  // Close modal on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') setPreviewModal(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
   const getTargetBackend = useCallback(() => {
@@ -63,15 +172,38 @@ export default function AdminPortalHome() {
       setLoading(true);
       const emailMap = new Map();
 
-      // 1. DIRECT QUERY TO SUPABASE CLOUD DATABASE
+      // 1. Fetch from authoritative API route first (has local persistence + photos)
       try {
-        const { data: rideRows, error: sbError } = await supabase
+        const activeBackend = getTargetBackend();
+        const headers = activeBackend ? { 'x-carpool-backend-url': activeBackend } : {};
+        const res = await fetch('/api/verifications', { headers, cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.verifications && Array.isArray(data.verifications)) {
+            data.verifications.forEach((v) => {
+              if (v && v.email) {
+                emailMap.set(v.email.toLowerCase().trim(), v);
+              }
+            });
+          }
+        }
+      } catch (e) {
+        console.error('API verifications fetch error:', e);
+      }
+
+      // 2. Also merge Supabase entries with a 3s safety timeout
+      try {
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Supabase timeout')), 3000)
+        );
+        const queryPromise = supabase
           .from('rides')
           .select('*')
           .ilike('status', 'VERIFICATION_%');
 
+        const { data: rideRows } = await Promise.race([queryPromise, timeoutPromise]);
+
         if (rideRows && rideRows.length > 0) {
-          // Group rows by user email
           const groups = new Map();
           rideRows.forEach((r) => {
             if (r.driver && (r.driver.type === 'DOC_VERIFICATION' || r.driver.email)) {
@@ -83,7 +215,6 @@ export default function AdminPortalHome() {
             }
           });
 
-          // For each user, sort descending by true timestamp and extract latest status & photos
           groups.forEach((userRows, userEmail) => {
             userRows.sort((a, b) => getRowTimestamp(b) - getRowTimestamp(a));
             const latest = userRows[0];
@@ -91,62 +222,31 @@ export default function AdminPortalHome() {
               (r) => r.driver?.idProofBase64 || r.driver?.drivingLicenseBase64
             ) || latest;
 
+            const existing = emailMap.get(userEmail);
             const status = latest.status === 'VERIFICATION_APPROVED' ? 'APPROVED'
               : latest.status === 'VERIFICATION_REJECTED' ? 'REJECTED'
-              : (latest.driver?.status || 'PENDING');
+              : (latest.driver?.status || existing?.status || 'PENDING');
 
             emailMap.set(userEmail, {
+              ...(existing || {}),
               ...photoRow.driver,
               ...latest.driver,
-              id: latest.driver?.id || latest.id,
+              id: latest.driver?.id || latest.id || existing?.id,
               status,
               rowId: latest.id,
-              idProofBase64: photoRow.driver?.idProofBase64 || latest.driver?.idProofBase64 || '',
-              idProofName: photoRow.driver?.idProofName || latest.driver?.idProofName || 'Identity Document',
-              drivingLicenseBase64: photoRow.driver?.drivingLicenseBase64 || latest.driver?.drivingLicenseBase64 || '',
-              drivingLicenseName: photoRow.driver?.drivingLicenseName || latest.driver?.drivingLicenseName || 'Driving License',
-              submittedAt: photoRow.driver?.submittedAt || latest.driver?.submittedAt || new Date(getRowTimestamp(photoRow)).toISOString(),
-              reviewedAt: latest.driver?.reviewedAt || (status !== 'PENDING' ? new Date(getRowTimestamp(latest)).toISOString() : null),
-              adminNotes: latest.driver?.adminNotes || '',
+              idProofBase64: existing?.idProofBase64 || photoRow.driver?.idProofBase64 || latest.driver?.idProofBase64 || '',
+              idProofName: existing?.idProofName || photoRow.driver?.idProofName || latest.driver?.idProofName || 'Identity Document',
+              drivingLicenseBase64: existing?.drivingLicenseBase64 || photoRow.driver?.drivingLicenseBase64 || latest.driver?.drivingLicenseBase64 || '',
+              drivingLicenseName: existing?.drivingLicenseName || photoRow.driver?.drivingLicenseName || latest.driver?.drivingLicenseName || 'Driving License',
+              submittedAt: latest.driver?.submittedAt || photoRow.driver?.submittedAt || existing?.submittedAt || new Date(getRowTimestamp(photoRow)).toISOString(),
+              reviewedAt: latest.driver?.reviewedAt || existing?.reviewedAt || (status !== 'PENDING' ? new Date(getRowTimestamp(latest)).toISOString() : null),
+              adminNotes: latest.driver?.adminNotes || existing?.adminNotes || '',
             });
           });
         }
       } catch (err) {
-        console.error('Supabase direct fetch error:', err);
+        // Supabase error or timeout; API data in emailMap is retained
       }
-
-      // 2. Also merge from API route if available
-      try {
-        const activeBackend = getTargetBackend();
-        const headers = activeBackend ? { 'x-carpool-backend-url': activeBackend } : {};
-        const res = await fetch('/api/verifications', { headers, cache: 'no-store' });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.verifications && Array.isArray(data.verifications)) {
-            data.verifications.forEach((v) => {
-              if (v && v.email) {
-                const normEmail = v.email.toLowerCase().trim();
-                const existing = emailMap.get(normEmail);
-                if (!existing) {
-                  emailMap.set(normEmail, v);
-                } else {
-                  // Merge if API has newer or richer data
-                  const vTime = new Date(v.reviewedAt || v.submittedAt || 0).getTime();
-                  const eTime = new Date(existing.reviewedAt || existing.submittedAt || 0).getTime();
-                  if (vTime > eTime) {
-                    emailMap.set(normEmail, {
-                      ...existing,
-                      ...v,
-                      idProofBase64: existing.idProofBase64 || v.idProofBase64 || '',
-                      drivingLicenseBase64: existing.drivingLicenseBase64 || v.drivingLicenseBase64 || '',
-                    });
-                  }
-                }
-              }
-            });
-          }
-        }
-      } catch (e) {}
 
       const list = Array.from(emailMap.values());
       setVerifications(
@@ -165,7 +265,6 @@ export default function AdminPortalHome() {
 
   useEffect(() => {
     fetchVerifications();
-    // Auto-refresh periodically every 5 seconds to catch new user uploads live
     const interval = setInterval(fetchVerifications, 5000);
     return () => clearInterval(interval);
   }, [fetchVerifications]);
@@ -203,7 +302,7 @@ export default function AdminPortalHome() {
         drivingLicenseName: item.drivingLicenseName || '',
       };
 
-      // 1. Direct write to Supabase cloud database
+      // 1. Direct write to Supabase
       try {
         await supabase.from('rides').insert([
           {
@@ -219,15 +318,14 @@ export default function AdminPortalHome() {
         console.error('Supabase direct review insert error:', sbErr);
       }
 
-      // 2. Also notify admin portal review API & backend if connected
+      // 2. Call local Admin Portal API Route
       try {
-        const headers = {
-          'Content-Type': 'application/json',
-          ...(activeBackend ? { 'x-carpool-backend-url': activeBackend } : {}),
-        };
         await fetch(`/api/verifications/${encodeURIComponent(item.id)}/review`, {
           method: 'POST',
-          headers,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(activeBackend ? { 'x-carpool-backend-url': activeBackend } : {}),
+          },
           body: JSON.stringify({ action, adminNotes: note }),
         });
       } catch (e) {}
@@ -235,24 +333,18 @@ export default function AdminPortalHome() {
       // Refresh to confirm live state from database
       await fetchVerifications();
     } catch (err) {
-      console.error('Error reviewing in admin portal:', err);
-      alert('Error updating status: ' + err.message);
+      console.error('Error updating review:', err);
+      alert('Error updating review status.');
     } finally {
       setActionInProgress((prev) => ({ ...prev, [item.id]: false }));
     }
   };
 
-  const handleConfigureBackend = () => {
-    const current = localStorage.getItem('raahi_carpool_backend_url') || backendUrl || '';
-    const entered = window.prompt(
-      'Enter your deployed Carpool App URL (e.g. https://your-carpool-app.vercel.app):',
-      current
-    );
-    if (entered !== null) {
-      const cleaned = entered.trim();
-      localStorage.setItem('raahi_carpool_backend_url', cleaned);
-      setBackendUrl(cleaned);
-      setTimeout(fetchVerifications, 100);
+  const handleSaveBackendUrl = () => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('raahi_carpool_backend_url', backendUrl.trim());
+      alert(`Connected Carpool Backend set to: ${backendUrl.trim() || 'Default auto-detect'}`);
+      fetchVerifications();
     }
   };
 
@@ -270,50 +362,48 @@ export default function AdminPortalHome() {
       {/* Top Bar */}
       <div className={styles.topBar}>
         <div className={styles.logoArea}>
-          <ShieldCheck size={28} color="#10b981" />
-          <span className={styles.logoTitle}>Raahi Admin</span>
-          <span className={styles.logoBadge}>PROD PORTAL</span>
+          <span className={styles.logoBadge}>OFFICIAL</span>
+          <span className={styles.logoTitle}>Raahi Admin Verification Portal</span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <button
-            type="button"
-            onClick={handleConfigureBackend}
-            style={{
-              background: 'rgba(16, 185, 129, 0.1)',
-              border: '1px solid rgba(16, 185, 129, 0.35)',
-              color: '#10b981',
-              padding: '5px 12px',
-              borderRadius: '6px',
-              fontSize: '0.8rem',
-              fontWeight: 500,
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-            }}
-            title="Click to configure deployed Carpool App URL"
-          >
-            <Globe size={13} />
-            {backendUrl ? `Backend: ${backendUrl.replace(/^https?:\/\//, '')}` : 'Connect Carpool App 🔗'}
-          </button>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-            <Lock size={14} color="#10b981" /> Live Sync
-          </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+          <Lock size={14} color="#10b981" />
+          <span>Independent Verification System</span>
         </div>
       </div>
 
+      {/* Backend API Configuration */}
+      <div className={styles.backendConfigBox}>
+        <div className={styles.configLabel}>
+          <Globe size={16} color="#0284c7" />
+          <span>Connected Carpool Backend Server URL:</span>
+        </div>
+        <div className={styles.configInputArea}>
+          <input
+            type="text"
+            className={styles.configInput}
+            value={backendUrl}
+            onChange={(e) => setBackendUrl(e.target.value)}
+            placeholder="e.g. http://localhost:3000"
+          />
+          <button type="button" className={styles.configSaveBtn} onClick={handleSaveBackendUrl}>
+            Save
+          </button>
+        </div>
+      </div>
+
+      {/* Header */}
       <div className={styles.header}>
         <div className={styles.titleArea}>
           <h1>
-            <FileText size={26} color="#10b981" /> Document Verification Portal
+            <ShieldCheck size={28} color="#10b981" /> Identity & License Verification
           </h1>
           <p className={styles.subtitle}>
-            Review official Aadhaar Cards & Driving Licenses submitted by Raahi users directly in Supabase.
+            Approve or reject user driver verifications. Review uploaded Aadhaar Cards & Driving Licenses with authentic document validation.
           </p>
         </div>
-        <div>
+        <div className={styles.headerActions}>
           <button className={styles.refreshBtn} onClick={fetchVerifications} disabled={loading}>
-            <RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh Records
+            <RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh
           </button>
         </div>
       </div>
@@ -321,11 +411,11 @@ export default function AdminPortalHome() {
       {/* Stats Bar */}
       <div className={styles.statsBar}>
         <div className={styles.statCard}>
-          <span className={styles.statLabel}>Total Submitted</span>
+          <span className={styles.statLabel}>Total Submissions</span>
           <span className={styles.statNumber}>{verifications.length}</span>
         </div>
         <div className={styles.statCard}>
-          <span className={styles.statLabel}>Pending Review</span>
+          <span className={styles.statLabel}>Awaiting Verification</span>
           <span className={`${styles.statNumber} ${styles.pendingStat}`}>{pendingCount}</span>
         </div>
         <div className={styles.statCard}>
@@ -344,7 +434,7 @@ export default function AdminPortalHome() {
           className={`${styles.tabBtn} ${filter === 'ALL' ? styles.activeTab : ''}`}
           onClick={() => setFilter('ALL')}
         >
-          All ({verifications.length})
+          All Submissions ({verifications.length})
         </button>
         <button
           className={`${styles.tabBtn} ${filter === 'PENDING' ? styles.activeTab : ''}`}
@@ -380,14 +470,16 @@ export default function AdminPortalHome() {
         <div className={styles.cardsGrid}>
           {filteredVerifications.map((item) => {
             const isWorking = actionInProgress[item.id];
-            const aadharSrc = item.idProofBase64;
-            const licenseSrc = item.drivingLicenseBase64;
+            const aadharSrc = formatDocSrc(item.idProofBase64);
+            const aadharIsImg = isImageDoc(aadharSrc, item.idProofName);
+            const licenseSrc = formatDocSrc(item.drivingLicenseBase64);
+            const licenseIsImg = isImageDoc(licenseSrc, item.drivingLicenseName);
 
             return (
               <div key={item.id} className={styles.verifCard}>
                 <div className={styles.cardTop}>
                   <div className={styles.userMeta}>
-                    <h2>{item.fullName}</h2>
+                    <h2>{item.fullName || 'User Document Verification'}</h2>
                     <div className={styles.metaRow}>
                       <span>
                         <Mail size={15} /> {item.email}
@@ -399,8 +491,8 @@ export default function AdminPortalHome() {
                       )}
                       <span>
                         <Calendar size={15} />{' '}
-                        {new Date(item.submittedAt).toLocaleDateString()}{' '}
-                        {new Date(item.submittedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        {new Date(item.submittedAt || Date.now()).toLocaleDateString()}{' '}
+                        {new Date(item.submittedAt || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                       </span>
                     </div>
                   </div>
@@ -432,30 +524,38 @@ export default function AdminPortalHome() {
                       <FileText size={18} color="#0284c7" />
                       <span>Aadhaar / Identity Proof Document</span>
                     </div>
-                    <div className={styles.previewBox}>
-                      {aadharSrc && (aadharSrc.startsWith('data:image/') || aadharSrc.startsWith('http') || /\.(png|jpe?g|webp|gif)$/i.test(item.idProofName)) ? (
-                        <img
-                          src={aadharSrc.startsWith('data:') || aadharSrc.startsWith('http') ? aadharSrc : `data:image/jpeg;base64,${aadharSrc}`}
-                          alt="Aadhaar ID Proof"
-                          className={styles.docImage}
-                          onClick={() => {
-                            const src = aadharSrc.startsWith('data:') || aadharSrc.startsWith('http') ? aadharSrc : `data:image/jpeg;base64,${aadharSrc}`;
-                            window.open(src, '_blank');
-                          }}
-                          title="Click to view full size"
-                        />
+                    <div
+                      className={styles.previewBox}
+                      onClick={() => {
+                        if (aadharSrc) {
+                          setPreviewModal({
+                            src: aadharSrc,
+                            title: `Aadhaar / ID Document - ${item.fullName || item.email}`,
+                            fileName: item.idProofName || 'aadhaar_card.jpg',
+                            isImage: aadharIsImg,
+                            user: item.fullName,
+                          });
+                        }
+                      }}
+                    >
+                      {aadharSrc && aadharIsImg ? (
+                        <>
+                          <img
+                            src={aadharSrc}
+                            alt="Aadhaar ID Proof"
+                            className={styles.docImage}
+                          />
+                          <div className={styles.previewOverlay}>
+                            <Eye size={18} /> Click to Inspect Photo
+                          </div>
+                        </>
                       ) : aadharSrc ? (
                         <div className={styles.pdfFallback}>
                           <FileText size={42} color="#0284c7" />
                           <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>PDF Document</span>
-                          <a
-                            href={aadharSrc}
-                            target="_blank"
-                            rel="noreferrer"
-                            className={styles.viewBtn}
-                          >
-                            <ExternalLink size={14} /> Open & View Document
-                          </a>
+                          <span style={{ fontSize: '0.8rem', color: 'var(--primary-500)' }}>
+                            Click to view PDF
+                          </span>
                         </div>
                       ) : (
                         <div className={styles.pdfFallback}>
@@ -465,16 +565,33 @@ export default function AdminPortalHome() {
                       )}
                     </div>
                     <div className={styles.docFooterRow}>
-                      <span className={styles.docFooter}>{item.idProofName}</span>
+                      <span className={styles.docFooter}>{item.idProofName || 'Identity Document'}</span>
                       {aadharSrc && (
-                        <a
-                          href={aadharSrc.startsWith('data:') || aadharSrc.startsWith('http') ? aadharSrc : `data:image/jpeg;base64,${aadharSrc}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className={styles.smallOpenLink}
-                        >
-                          <ExternalLink size={12} /> View Full
-                        </a>
+                        <div className={styles.docActions}>
+                          <button
+                            type="button"
+                            className={styles.inspectBtn}
+                            onClick={() =>
+                              setPreviewModal({
+                                src: aadharSrc,
+                                title: `Aadhaar / ID Document - ${item.fullName || item.email}`,
+                                fileName: item.idProofName || 'aadhaar_card.jpg',
+                                isImage: aadharIsImg,
+                                user: item.fullName,
+                              })
+                            }
+                          >
+                            <Maximize2 size={13} /> Inspect
+                          </button>
+                          <button
+                            type="button"
+                            className={styles.downloadBtn}
+                            onClick={() => downloadDocument(aadharSrc, item.idProofName || 'aadhaar_card.jpg')}
+                            title="Download original file"
+                          >
+                            <Download size={13} /> Download
+                          </button>
+                        </div>
                       )}
                     </div>
                   </div>
@@ -485,30 +602,38 @@ export default function AdminPortalHome() {
                       <FileText size={18} color="#10b981" />
                       <span>Driving License Document</span>
                     </div>
-                    <div className={styles.previewBox}>
-                      {licenseSrc && (licenseSrc.startsWith('data:image/') || licenseSrc.startsWith('http') || /\.(png|jpe?g|webp|gif)$/i.test(item.drivingLicenseName)) ? (
-                        <img
-                          src={licenseSrc.startsWith('data:') || licenseSrc.startsWith('http') ? licenseSrc : `data:image/jpeg;base64,${licenseSrc}`}
-                          alt="Driving License"
-                          className={styles.docImage}
-                          onClick={() => {
-                            const src = licenseSrc.startsWith('data:') || licenseSrc.startsWith('http') ? licenseSrc : `data:image/jpeg;base64,${licenseSrc}`;
-                            window.open(src, '_blank');
-                          }}
-                          title="Click to view full size"
-                        />
+                    <div
+                      className={styles.previewBox}
+                      onClick={() => {
+                        if (licenseSrc) {
+                          setPreviewModal({
+                            src: licenseSrc,
+                            title: `Driving License - ${item.fullName || item.email}`,
+                            fileName: item.drivingLicenseName || 'driving_license.jpg',
+                            isImage: licenseIsImg,
+                            user: item.fullName,
+                          });
+                        }
+                      }}
+                    >
+                      {licenseSrc && licenseIsImg ? (
+                        <>
+                          <img
+                            src={licenseSrc}
+                            alt="Driving License"
+                            className={styles.docImage}
+                          />
+                          <div className={styles.previewOverlay}>
+                            <Eye size={18} /> Click to Inspect Photo
+                          </div>
+                        </>
                       ) : licenseSrc ? (
                         <div className={styles.pdfFallback}>
                           <FileText size={42} color="#10b981" />
                           <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>PDF Document</span>
-                          <a
-                            href={licenseSrc}
-                            target="_blank"
-                            rel="noreferrer"
-                            className={styles.viewBtn}
-                          >
-                            <ExternalLink size={14} /> Open & View Document
-                          </a>
+                          <span style={{ fontSize: '0.8rem', color: 'var(--primary-500)' }}>
+                            Click to view PDF
+                          </span>
                         </div>
                       ) : (
                         <div className={styles.pdfFallback}>
@@ -518,22 +643,39 @@ export default function AdminPortalHome() {
                       )}
                     </div>
                     <div className={styles.docFooterRow}>
-                      <span className={styles.docFooter}>{item.drivingLicenseName}</span>
+                      <span className={styles.docFooter}>{item.drivingLicenseName || 'Driving License'}</span>
                       {licenseSrc && (
-                        <a
-                          href={licenseSrc.startsWith('data:') || licenseSrc.startsWith('http') ? licenseSrc : `data:image/jpeg;base64,${licenseSrc}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className={styles.smallOpenLink}
-                        >
-                          <ExternalLink size={12} /> View Full
-                        </a>
+                        <div className={styles.docActions}>
+                          <button
+                            type="button"
+                            className={styles.inspectBtn}
+                            onClick={() =>
+                              setPreviewModal({
+                                src: licenseSrc,
+                                title: `Driving License - ${item.fullName || item.email}`,
+                                fileName: item.drivingLicenseName || 'driving_license.jpg',
+                                isImage: licenseIsImg,
+                                user: item.fullName,
+                              })
+                            }
+                          >
+                            <Maximize2 size={13} /> Inspect
+                          </button>
+                          <button
+                            type="button"
+                            className={styles.downloadBtn}
+                            onClick={() => downloadDocument(licenseSrc, item.drivingLicenseName || 'driving_license.jpg')}
+                            title="Download original file"
+                          >
+                            <Download size={13} /> Download
+                          </button>
+                        </div>
                       )}
                     </div>
                   </div>
                 </div>
 
-                {/* Feedback remarks if reviewed */}
+                {/* Feedback / Admin Notes display if reviewed */}
                 {item.adminNotes && (
                   <div className={styles.reviewFeedback}>
                     <div className={styles.feedbackTitle}>Backend Verification Remarks:</div>
@@ -545,7 +687,7 @@ export default function AdminPortalHome() {
                 <div className={styles.actionArea}>
                   <input
                     type="text"
-                    placeholder="Remarks (e.g., 'Invalid documents try with Original documents' or 'Clear DL verified')"
+                    placeholder="Remarks (e.g. 'Invalid documents try with Original documents' or 'Verified & approved')"
                     className={styles.notesInput}
                     value={adminNotes[item.id] !== undefined ? adminNotes[item.id] : ''}
                     onChange={(e) =>
@@ -575,6 +717,68 @@ export default function AdminPortalHome() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Document Lightbox / Fullscreen Modal */}
+      {previewModal && (
+        <div className={styles.modalBackdrop} onClick={() => setPreviewModal(null)}>
+          <div className={styles.modalContainer} onClick={(e) => e.stopPropagation()}>
+            <div className={styles.modalHeader}>
+              <div className={styles.modalHeaderInfo}>
+                <h3>
+                  <FileText size={20} color="#10b981" /> {previewModal.title}
+                </h3>
+                <p>Original filename: {previewModal.fileName}</p>
+              </div>
+              <button
+                type="button"
+                className={styles.modalCloseBtn}
+                onClick={() => setPreviewModal(null)}
+                aria-label="Close Preview"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className={styles.modalBody}>
+              {previewModal.isImage ? (
+                <img
+                  src={previewModal.src}
+                  alt={previewModal.title}
+                  className={styles.modalImage}
+                />
+              ) : (
+                <iframe
+                  src={previewModal.src}
+                  title={previewModal.title}
+                  className={styles.modalIframe}
+                />
+              )}
+            </div>
+
+            <div className={styles.modalFooter}>
+              <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                Press <kbd style={{ background: 'var(--bg-hover)', padding: '2px 6px', borderRadius: '4px', border: '1px solid var(--border-color)' }}>Esc</kbd> or click background to exit
+              </div>
+              <div className={styles.modalFooterActions}>
+                <button
+                  type="button"
+                  className={styles.inspectBtn}
+                  onClick={() => openInNewTab(previewModal.src, previewModal.title)}
+                >
+                  <ExternalLink size={14} /> Open in New Tab
+                </button>
+                <button
+                  type="button"
+                  className={styles.approveBtn}
+                  onClick={() => downloadDocument(previewModal.src, previewModal.fileName)}
+                >
+                  <Download size={15} /> Download Document
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

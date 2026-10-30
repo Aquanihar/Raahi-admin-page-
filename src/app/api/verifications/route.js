@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { supabase } from '@/lib/supabase';
 
-async function withTimeout(promise, ms = 1500) {
+async function withTimeout(promise, ms = 2000) {
   let timeoutId;
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error('Timeout')), ms);
@@ -45,7 +45,44 @@ function getRowTimestamp(r) {
 export async function GET(req) {
   const recordsMap = new Map();
 
-  // 1. Supabase rides database query (primary cloud source)
+  // 1. Authoritative local file storage (always has full base64 photos)
+  const fileRecords = getLocalVerificationsFromFile();
+  fileRecords.forEach((r) => {
+    if (r && (r.email || r.id)) {
+      const email = (r.email || r.id).toLowerCase().trim();
+      recordsMap.set(email, { ...r, email });
+    }
+  });
+
+  // 2. Fetch from Carpool App API if available
+  const customBackendUrl = req.headers.get('x-carpool-backend-url');
+  const backendBase = customBackendUrl || process.env.CARPOOL_API_URL || process.env.NEXT_PUBLIC_CARPOOL_API_URL || 'http://localhost:3000';
+  if (backendBase) {
+    try {
+      const targetUrl = backendBase.replace(/\/$/, '') + '/api/verification';
+      const res = await withTimeout(fetch(targetUrl, { cache: 'no-store' }), 2000);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.verifications && Array.isArray(data.verifications)) {
+          data.verifications.forEach((r) => {
+            if (r && r.email) {
+              const email = r.email.toLowerCase().trim();
+              const existing = recordsMap.get(email);
+              recordsMap.set(email, {
+                ...(existing || {}),
+                ...r,
+                email,
+                idProofBase64: r.idProofBase64 || existing?.idProofBase64 || '',
+                drivingLicenseBase64: r.drivingLicenseBase64 || existing?.drivingLicenseBase64 || '',
+              });
+            }
+          });
+        }
+      }
+    } catch (err) {}
+  }
+
+  // 3. Supabase rides cloud query with timeout
   try {
     const { data: rows } = await withTimeout(
       supabase
@@ -73,61 +110,30 @@ export async function GET(req) {
           (r) => r.driver?.idProofBase64 || r.driver?.drivingLicenseBase64
         ) || latest;
 
+        const existing = recordsMap.get(email);
         const status = latest.status === 'VERIFICATION_APPROVED' ? 'APPROVED'
           : latest.status === 'VERIFICATION_REJECTED' ? 'REJECTED'
-          : (latest.driver?.status || 'PENDING');
+          : (latest.driver?.status || existing?.status || 'PENDING');
 
         recordsMap.set(email, {
+          ...(existing || {}),
           ...photoRow.driver,
           ...latest.driver,
-          id: latest.driver?.id || latest.id,
+          id: latest.driver?.id || latest.id || existing?.id,
+          email,
           status,
           rowId: latest.id,
-          idProofBase64: photoRow.driver?.idProofBase64 || latest.driver?.idProofBase64 || '',
-          idProofName: photoRow.driver?.idProofName || latest.driver?.idProofName || 'Identity Document',
-          drivingLicenseBase64: photoRow.driver?.drivingLicenseBase64 || latest.driver?.drivingLicenseBase64 || '',
-          drivingLicenseName: photoRow.driver?.drivingLicenseName || latest.driver?.drivingLicenseName || 'Driving License',
-          submittedAt: photoRow.driver?.submittedAt || latest.driver?.submittedAt || new Date(getRowTimestamp(photoRow)).toISOString(),
-          reviewedAt: latest.driver?.reviewedAt || (status !== 'PENDING' ? new Date(getRowTimestamp(latest)).toISOString() : null),
-          adminNotes: latest.driver?.adminNotes || '',
+          idProofBase64: photoRow.driver?.idProofBase64 || latest.driver?.idProofBase64 || existing?.idProofBase64 || '',
+          idProofName: photoRow.driver?.idProofName || latest.driver?.idProofName || existing?.idProofName || 'Identity Document',
+          drivingLicenseBase64: photoRow.driver?.drivingLicenseBase64 || latest.driver?.drivingLicenseBase64 || existing?.drivingLicenseBase64 || '',
+          drivingLicenseName: photoRow.driver?.drivingLicenseName || latest.driver?.drivingLicenseName || existing?.drivingLicenseName || 'Driving License',
+          submittedAt: latest.driver?.submittedAt || photoRow.driver?.submittedAt || existing?.submittedAt || new Date(getRowTimestamp(photoRow)).toISOString(),
+          reviewedAt: latest.driver?.reviewedAt || existing?.reviewedAt || (status !== 'PENDING' ? new Date(getRowTimestamp(latest)).toISOString() : null),
+          adminNotes: latest.driver?.adminNotes || existing?.adminNotes || '',
         });
       });
     }
   } catch (err) {}
-
-  // 2. Fetch from Carpool App API if configured
-  const customBackendUrl = req.headers.get('x-carpool-backend-url');
-  const backendBase = customBackendUrl || process.env.CARPOOL_API_URL || process.env.NEXT_PUBLIC_CARPOOL_API_URL;
-  if (backendBase) {
-    try {
-      const targetUrl = backendBase.replace(/\/$/, '') + '/api/verification';
-      const res = await withTimeout(fetch(targetUrl, { cache: 'no-store' }), 2000);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.verifications && Array.isArray(data.verifications)) {
-          data.verifications.forEach((r) => {
-            if (r && r.email) {
-              const email = r.email.toLowerCase().trim();
-              if (!recordsMap.has(email)) {
-                recordsMap.set(email, r);
-              }
-            }
-          });
-        }
-      }
-    } catch (err) {}
-  }
-
-  // 3. Fallback to shared local file if records not present
-  const fileRecords = getLocalVerificationsFromFile();
-  fileRecords.forEach((r) => {
-    if (r && r.email) {
-      const email = r.email.toLowerCase().trim();
-      if (!recordsMap.has(email)) {
-        recordsMap.set(email, r);
-      }
-    }
-  });
 
   const result = Array.from(recordsMap.values()).sort(
     (a, b) =>
