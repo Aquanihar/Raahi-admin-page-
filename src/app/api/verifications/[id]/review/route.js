@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { supabase } from '@/lib/supabase';
 
-async function withTimeout(promise, ms = 1500) {
+async function withTimeout(promise, ms = 2000) {
   let timeoutId;
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error('Timeout')), ms);
@@ -17,39 +17,43 @@ async function withTimeout(promise, ms = 1500) {
 }
 
 function updateLocalFile(id, action, adminNotes) {
-  try {
-    const carpoolDataFile = path.resolve(process.cwd(), '..', 'Carpool app', 'data', 'verifications.json');
-    if (fs.existsSync(carpoolDataFile)) {
-      const raw = fs.readFileSync(carpoolDataFile, 'utf8');
-      const list = JSON.parse(raw);
-      if (Array.isArray(list)) {
-        let updatedItem = null;
-        const status = action === 'APPROVE' ? 'APPROVED' : 'REJECTED';
-        const reviewedAt = new Date().toISOString();
+  let updatedItem = null;
+  const status = action === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+  const reviewedAt = new Date().toISOString();
 
-        const updatedList = list.map((item) => {
-          if (item.id === id || item.email?.toLowerCase() === id.toLowerCase()) {
-            updatedItem = {
-              ...item,
-              status,
-              adminNotes: adminNotes || (action === 'REJECT' ? 'Invalid documents try with Original documents' : 'Verified successfully.'),
-              reviewedAt,
-            };
-            return updatedItem;
-          }
-          return item;
-        });
+  const files = [
+    path.resolve(process.cwd(), 'data', 'verifications.json'),
+    path.resolve(process.cwd(), '..', 'Carpool app', 'data', 'verifications.json'),
+  ];
 
-        if (updatedItem) {
-          fs.writeFileSync(carpoolDataFile, JSON.stringify(updatedList, null, 2), 'utf8');
-          return updatedItem;
+  files.forEach((filePath) => {
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const list = JSON.parse(raw);
+        if (Array.isArray(list)) {
+          const updatedList = list.map((item) => {
+            if (item.id === id || item.email?.toLowerCase() === id.toLowerCase()) {
+              const u = {
+                ...item,
+                status,
+                adminNotes: adminNotes || (action === 'REJECT' ? 'Invalid documents try with Original documents' : 'Verified successfully.'),
+                reviewedAt,
+              };
+              updatedItem = u;
+              return u;
+            }
+            return item;
+          });
+          fs.writeFileSync(filePath, JSON.stringify(updatedList, null, 2), 'utf8');
         }
       }
+    } catch (err) {
+      console.error('Error updating local file in review:', err.message);
     }
-  } catch (err) {
-    console.error('Error updating local file in review:', err.message);
-  }
-  return null;
+  });
+
+  return updatedItem;
 }
 
 export async function POST(req, { params }) {
@@ -83,11 +87,10 @@ export async function POST(req, { params }) {
       } catch (e) {}
     }
 
-    // 2. If Carpool app was not reached, check local file
+    // 2. Update local files (internal and shared)
+    const localResult = updateLocalFile(id, action, adminNotes);
     if (!updatedRecord) {
-      updatedRecord = updateLocalFile(id, action, adminNotes);
-    } else {
-      updateLocalFile(id, action, adminNotes);
+      updatedRecord = localResult;
     }
 
     // 3. If still no record, query Supabase cloud rides table directly

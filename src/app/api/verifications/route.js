@@ -18,7 +18,15 @@ async function withTimeout(promise, ms = 2000) {
 
 function getLocalVerificationsFromFile() {
   try {
-    // Check Carpool app shared data folder
+    // 1. Check internal data file inside raahi-admin-portal
+    const internalDataFile = path.resolve(process.cwd(), 'data', 'verifications.json');
+    if (fs.existsSync(internalDataFile)) {
+      const raw = fs.readFileSync(internalDataFile, 'utf8');
+      const list = JSON.parse(raw);
+      if (Array.isArray(list) && list.length > 0) return list;
+    }
+
+    // 2. Fallback to Carpool app shared folder
     const carpoolDataFile = path.resolve(process.cwd(), '..', 'Carpool app', 'data', 'verifications.json');
     if (fs.existsSync(carpoolDataFile)) {
       const raw = fs.readFileSync(carpoolDataFile, 'utf8');
