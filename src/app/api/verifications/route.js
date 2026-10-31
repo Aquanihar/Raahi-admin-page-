@@ -17,26 +17,40 @@ async function withTimeout(promise, ms = 2000) {
 }
 
 function getLocalVerificationsFromFile() {
-  try {
-    // 1. Check internal data file inside raahi-admin-portal
-    const internalDataFile = path.resolve(process.cwd(), 'data', 'verifications.json');
-    if (fs.existsSync(internalDataFile)) {
-      const raw = fs.readFileSync(internalDataFile, 'utf8');
-      const list = JSON.parse(raw);
-      if (Array.isArray(list) && list.length > 0) return list;
-    }
+  const mergedMap = new Map();
+  const potentialPaths = [
+    path.resolve(process.cwd(), 'data', 'verifications.json'),
+    path.resolve(process.cwd(), '..', 'Carpool app', 'data', 'verifications.json'),
+    path.resolve(process.cwd(), '..', 'raahi-admin-portal', 'data', 'verifications.json'),
+    'C:\\Users\\Nihar Shankar Parab\\Projects\\Carpool app\\data\\verifications.json',
+    'C:\\Users\\Nihar Shankar Parab\\Projects\\raahi-admin-portal\\data\\verifications.json',
+  ];
 
-    // 2. Fallback to Carpool app shared folder
-    const carpoolDataFile = path.resolve(process.cwd(), '..', 'Carpool app', 'data', 'verifications.json');
-    if (fs.existsSync(carpoolDataFile)) {
-      const raw = fs.readFileSync(carpoolDataFile, 'utf8');
-      const list = JSON.parse(raw);
-      if (Array.isArray(list)) return list;
-    }
-  } catch (err) {
-    console.error('Error reading shared verifications file:', err.message);
+  for (const filePath of potentialPaths) {
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const list = JSON.parse(raw);
+        if (Array.isArray(list)) {
+          list.forEach((rec) => {
+            if (rec && (rec.id || rec.email)) {
+              const recId = rec.id || (rec.email ? rec.email.toLowerCase().trim() : 'rec_' + Math.random());
+              const existing = mergedMap.get(recId);
+              mergedMap.set(recId, {
+                ...(existing || {}),
+                ...rec,
+                id: recId,
+                idProofBase64: rec.idProofBase64 || existing?.idProofBase64 || '',
+                drivingLicenseBase64: rec.drivingLicenseBase64 || existing?.drivingLicenseBase64 || '',
+              });
+            }
+          });
+        }
+      }
+    } catch (err) {}
   }
-  return [];
+
+  return Array.from(mergedMap.values());
 }
 
 function getRowTimestamp(r) {
@@ -56,9 +70,9 @@ export async function GET(req) {
   // 1. Authoritative local file storage (always has full base64 photos)
   const fileRecords = getLocalVerificationsFromFile();
   fileRecords.forEach((r) => {
-    if (r && (r.email || r.id)) {
-      const email = (r.email || r.id).toLowerCase().trim();
-      recordsMap.set(email, { ...r, email });
+    if (r && (r.id || r.email)) {
+      const subId = r.id || (r.email ? r.email.toLowerCase().trim() : 'rec_' + Math.random());
+      recordsMap.set(subId, { ...r, id: subId });
     }
   });
 
@@ -73,13 +87,13 @@ export async function GET(req) {
         const data = await res.json();
         if (data.verifications && Array.isArray(data.verifications)) {
           data.verifications.forEach((r) => {
-            if (r && r.email) {
-              const email = r.email.toLowerCase().trim();
-              const existing = recordsMap.get(email);
-              recordsMap.set(email, {
+            if (r && (r.id || r.email)) {
+              const subId = r.id || (r.email ? r.email.toLowerCase().trim() : 'rec_' + Math.random());
+              const existing = recordsMap.get(subId);
+              recordsMap.set(subId, {
                 ...(existing || {}),
                 ...r,
-                email,
+                id: subId,
                 idProofBase64: r.idProofBase64 || existing?.idProofBase64 || '',
                 drivingLicenseBase64: r.drivingLicenseBase64 || existing?.drivingLicenseBase64 || '',
               });
@@ -100,53 +114,37 @@ export async function GET(req) {
       3000
     );
     if (rows && Array.isArray(rows)) {
-      const groups = new Map();
       rows.forEach((r) => {
         if (r.driver && (r.driver.type === 'DOC_VERIFICATION' || r.driver.email)) {
-          const email = (r.driver.email || '').toLowerCase().trim();
-          if (email) {
-            if (!groups.has(email)) groups.set(email, []);
-            groups.get(email).push(r);
-          }
+          const recId = r.driver.id || r.id;
+          const existing = recordsMap.get(recId);
+          const status = r.status === 'VERIFICATION_APPROVED' ? 'APPROVED'
+            : r.status === 'VERIFICATION_REJECTED' ? 'REJECTED'
+            : (r.driver?.status || existing?.status || 'PENDING');
+
+          recordsMap.set(recId, {
+            ...(existing || {}),
+            ...r.driver,
+            id: recId,
+            status,
+            rowId: r.id,
+            idProofBase64: r.driver?.idProofBase64 || existing?.idProofBase64 || '',
+            idProofName: r.driver?.idProofName || existing?.idProofName || 'Identity Document',
+            drivingLicenseBase64: r.driver?.drivingLicenseBase64 || existing?.drivingLicenseBase64 || '',
+            drivingLicenseName: r.driver?.drivingLicenseName || existing?.drivingLicenseName || 'Driving License',
+            submittedAt: r.driver?.submittedAt || existing?.submittedAt || r.created_at,
+            reviewedAt: r.driver?.reviewedAt || existing?.reviewedAt || (status !== 'PENDING' ? r.updated_at : null),
+            adminNotes: r.driver?.adminNotes || existing?.adminNotes || '',
+          });
         }
-      });
-
-      groups.forEach((userRows, email) => {
-        userRows.sort((a, b) => getRowTimestamp(b) - getRowTimestamp(a));
-        const latest = userRows[0];
-        const photoRow = userRows.find(
-          (r) => r.driver?.idProofBase64 || r.driver?.drivingLicenseBase64
-        ) || latest;
-
-        const existing = recordsMap.get(email);
-        const status = latest.status === 'VERIFICATION_APPROVED' ? 'APPROVED'
-          : latest.status === 'VERIFICATION_REJECTED' ? 'REJECTED'
-          : (latest.driver?.status || existing?.status || 'PENDING');
-
-        recordsMap.set(email, {
-          ...(existing || {}),
-          ...photoRow.driver,
-          ...latest.driver,
-          id: latest.driver?.id || latest.id || existing?.id,
-          email,
-          status,
-          rowId: latest.id,
-          idProofBase64: photoRow.driver?.idProofBase64 || latest.driver?.idProofBase64 || existing?.idProofBase64 || '',
-          idProofName: photoRow.driver?.idProofName || latest.driver?.idProofName || existing?.idProofName || 'Identity Document',
-          drivingLicenseBase64: photoRow.driver?.drivingLicenseBase64 || latest.driver?.drivingLicenseBase64 || existing?.drivingLicenseBase64 || '',
-          drivingLicenseName: photoRow.driver?.drivingLicenseName || latest.driver?.drivingLicenseName || existing?.drivingLicenseName || 'Driving License',
-          submittedAt: latest.driver?.submittedAt || photoRow.driver?.submittedAt || existing?.submittedAt || new Date(getRowTimestamp(photoRow)).toISOString(),
-          reviewedAt: latest.driver?.reviewedAt || existing?.reviewedAt || (status !== 'PENDING' ? new Date(getRowTimestamp(latest)).toISOString() : null),
-          adminNotes: latest.driver?.adminNotes || existing?.adminNotes || '',
-        });
       });
     }
   } catch (err) {}
 
   const result = Array.from(recordsMap.values()).sort(
     (a, b) =>
-      new Date(b.reviewedAt || b.submittedAt || 0) -
-      new Date(a.reviewedAt || a.submittedAt || 0)
+      new Date(b.submittedAt || b.reviewedAt || 0) -
+      new Date(a.submittedAt || a.reviewedAt || 0)
   );
 
   return Response.json({ success: true, verifications: result });
